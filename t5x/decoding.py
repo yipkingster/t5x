@@ -1143,6 +1143,8 @@ def beam_search(
     decode_rng: Optional[jnp.ndarray] = None,
     cache_offset: int = 0,
     initial_index: Optional[jnp.ndarray] = None,
+    num_beam_grps: int = 1,
+    diversity_strength: float = 0.5,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Beam search for transformer machine translation.
 
@@ -1189,6 +1191,10 @@ def beam_search(
       autoregressively (so it will be slow). When set, this also assumes that
       the cache is appropriately populated. Since inputs are padded on the left
       with BOS = 0, these are also the lengths of the prompts.
+    num_beam_grps: int: number of beam groups. If set to > 1, diverse beam
+      search is performed.
+    diversity_strength: float: diversity strength. Only used when num_beam_grps
+      > 1.
 
   Returns:
      Tuple of:
@@ -1299,6 +1305,94 @@ def beam_search(
         & (~exceed_max_decode_step)
     )
 
+  def update_logprobs_with_prev_group(
+    logprobs: jnp.ndarray,
+    prev_token_ids: jnp.ndarray,
+    vocab_size: int,
+    diversity_strength: float,
+  ) -> jnp.ndarray:
+    """Update logprobs with previous group."""
+    # Shape of logprobs: [batch, beam_group_size, vocab_size]
+    # Shape of prev_token_ids: [batch, 2*K1]
+    # Shape of occurences_one_hot: [batch, 2*K1, vocab_size]
+    # Create one hot from tokens chosen from previous groups.
+    occurences_one_hot = jax.nn.one_hot(prev_token_ids, vocab_size)
+    # Sum the one hot vectors to get the frequency of each token.
+    # Shape of token_frequency: [batch, vocab_size]
+    token_frequency = jnp.sum(occurences_one_hot, axis=1)
+    # Update logprobs for each vocab by subtracting the penalty.
+    logprobs -= diversity_strength * jnp.expand_dims(token_frequency, axis=1)
+    return logprobs
+
+  def flatten_group(logprobs: jnp.ndarray) -> jnp.ndarray:
+    """Flatten the group logprobs."""
+    # Shape of logprobs: [batch, beam_group_size, vocab_size]
+    # Shape of flattened logprobs: [batch, beam_group_size * vocab_size]
+    return logprobs.reshape((logprobs.shape[0], -1))
+
+  def diverse_beam_search_top_k(
+    logprobs: jnp.ndarray,
+    beams_to_keep: int,
+    diversity_strength: float,
+    num_beam_grps: int,
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Diverse beam search top-k.
+
+    Args:
+      logprobs: [batch, beam, vocab_size]
+      beams_to_keep: number of beams to keep, usually 2 * beam_size
+      diversity_strength: diversity strength.
+      num_beam_grps: number of beam groups
+    """
+    # Explicitly check that beams_to_keep is divisible by num_beam_grps.
+    # This will avoid corner case where less than 2K beams are returned.
+    if num_beam_grps > 1 and beams_to_keep % num_beam_grps != 0:
+      raise ValueError(
+          f"beams_to_keep ({beams_to_keep}) must be divisible by "
+          f"num_beam_grps ({num_beam_grps}) for Diverse Beam Search."
+      )
+
+    # Shape of logprobs: [batch, beam, vocab_size]
+    # divide the input into groups
+    vocab_size = logprobs.shape[-1]
+    # Type of groups: list of [batch, group_size, vocab_size]
+    groups = jnp.array_split(logprobs, num_beam_grps, axis=1)
+    beam_group_size = beams_to_keep // num_beam_grps
+    # Run top_k for the first group
+    # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
+    # --> [batch, 2*K1], [batch, 2*K1]
+    cur_topk_log_probs, cur_topk_indices = top_k_two_stage(
+        flatten_group(groups[0]), k=beam_group_size
+    )
+    # Get the actual token ids
+    cur_token_ids = cur_topk_indices % vocab_size
+    group_offset = groups[0].shape[1] * vocab_size
+    for i in range(1, num_beam_grps):
+      # Get the new group logprobs via the current top-k logprobs
+      new_group_logprobs = update_logprobs_with_prev_group(
+        groups[i],
+        cur_token_ids,
+        vocab_size,
+        diversity_strength,
+      )
+      # Get top-k logprobs of the new group
+      new_topk_log_probs, new_topk_indices = top_k_two_stage(
+        flatten_group(new_group_logprobs), k=beam_group_size
+      )
+      
+      # Merge with the current logprobs
+      cur_topk_log_probs = jnp.concatenate(
+        [cur_topk_log_probs, new_topk_log_probs], axis=-1
+      )
+      new_topk_indices += group_offset
+      group_offset += groups[i].shape[1] * vocab_size
+      cur_topk_indices = jnp.concatenate(
+        [cur_topk_indices, new_topk_indices], axis=-1
+      )
+      cur_token_ids = cur_topk_indices % vocab_size
+    
+    return cur_topk_log_probs, cur_topk_indices
+
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
     """Beam search loop state update function."""
     # Collect the current position slice along length to feed the fast
@@ -1355,11 +1449,23 @@ def beam_search(
     beams_to_keep = 2 * beam_size
     # Flatten beam and vocab dimensions.
     flat_log_probs = log_probs.reshape((batch_size, beam_size * vocab_size))
-    # Gather the top 2*K scores from _all_ beams.
-    # --> [batch, 2*beams], [batch, 2*beams]
-    topk_log_probs, topk_indices = top_k_two_stage(
-        flat_log_probs, k=beams_to_keep
-    )
+    if num_beam_grps == 1:
+      # This is traditional beam search.
+      # Gather the top 2*K scores from _all_ beams.
+      # --> [batch, 2*beams], [batch, 2*beams]
+      topk_log_probs, topk_indices = top_k_two_stage(
+          flat_log_probs, k=beams_to_keep
+      )
+    else:
+      # This is diverse beam search.
+      topk_log_probs, topk_indices = diverse_beam_search_top_k(
+          # Note DBS doesn't use flattened logprobs, it needs to divide the
+          # beams into groups
+          log_probs,
+          beams_to_keep,
+          diversity_strength,
+          num_beam_grps,
+      )
 
     # Append the most probable 2*K token IDs to the top 2*K sequences
     # Recover token id by modulo division.

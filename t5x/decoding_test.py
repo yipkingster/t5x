@@ -1068,6 +1068,153 @@ class DecodeTest(parameterized.TestCase):
     expected = ['START-AABBA-END', 'START-BBAAB-END']
     np.testing.assert_array_equal(expected, top_scoring_strings)
 
+  def test_diverse_beam_search(self):
+    batch_size = 2
+    beam_size = 4
+    num_beam_grps = 2
+
+    # PAD doesn't matter for this test, but part of the contract for beam_search
+    # is giving the PAD token id 0.
+    states = ['PAD', 'A', 'B', 'C', 'START-', '-END']
+    num_states = len(states)
+    decode_length = 7
+
+    # Edge potentials (including 2 "C" diversity states as alternatives at Step 2):
+    #
+    #            1      -1       1       -1
+    #         A1 --- A2 --- A3 --- A4 --- A5
+    #          0  \ \  / / \  / \   /   \   /  0
+    #              \  C  /  \ /   \   /  \ /
+    # START     ----  X1  -- X2 --- X3 -- X4 ---- END
+    #              /  C  \  / \   /   \  / \
+    #          0  / /  \ \ /  \ / /  \ \ /  \  0
+    #         B1 --- B2 --- B3 --- B4 --- B5
+    #            1      -1       1       -1
+    #
+    #  * Each "C" node has exactly the same incoming and outgoing
+    #    edge potentials as its corresponding row-peer (A or B).
+    #
+    # put the above edge potentials in a 3-tensor: [timestep, start, end]
+    # Since we have A, B and C nodes, we need 3x3 edge potentials. The shape is
+    # [4, 3, 3]
+    abc_edge_potentials = np.asarray([
+        # Timestep 1: We are at A or B, we can go to A or B or C.
+        # A-1-A, A-(-1)-B, A-1-C; C is a divered alt for A2.
+        # B-(-1)-A, B-1-B, B-1-C; C is a divered alt for B2.
+        # C isn't connected to START.
+        [[1, -1, 1], [-1, 1, 1], [NEG_INF, NEG_INF, NEG_INF]],
+        # Timestep 2: We are at A or B or C. We can go to A or B.
+        # A-(-1)-A, A-1-B, A can't go to C;
+        # B-1-A, B-(-1)-B, B can't go to C;
+        # C-1-A, C-1-B, C can't go to C; C is the same hub as A2-B3 and B2-A3.
+        [[-1, 1, NEG_INF], [1, -1, NEG_INF], [1, 1, NEG_INF]],
+        # Timestep 3: We are at A or B. We can go to A or B.
+        # A-1-A, A-(-1)-B, A can't go to C.
+        # B-(-1)-A, B-1-B, B can't go to C.
+        [[1, -1, NEG_INF], [-1, 1, NEG_INF], [NEG_INF, NEG_INF, NEG_INF]],
+        # Timestep 4: We are at A or B. We can go to A or B.
+        # A-(-1)-A, A-1-B, A can't go to C.
+        # B-1-A, B-(-1)-B, B can't go to C.
+        [[-1, 1, NEG_INF], [1, -1, NEG_INF], [NEG_INF, NEG_INF, NEG_INF]],
+    ])
+    # now we have to add on the START, END states
+    # and PAD at 0
+    edge_potentials = np.ones([6, 6, 6]) * NEG_INF
+    edge_potentials[1:5, 1:4, 1:4] = abc_edge_potentials
+    # START can go to either A or B for free at t0
+    edge_potentials[0, 4, 1] = 0
+    edge_potentials[0, 4, 2] = 0
+    # either A or B can go to END for free at t5
+    edge_potentials[5, 1, 5] = 0
+    edge_potentials[5, 2, 5] = 0
+    # PAD can go to anything for free (doesn't matter for this test)
+    edge_potentials[:, 0, :] = 0
+
+    edge_potentials = jnp.asarray(edge_potentials)
+
+    # at time 0, we start with state=START=4
+    logits0 = jnp.asarray([NEG_INF, NEG_INF, NEG_INF, NEG_INF, 0, NEG_INF])
+
+    # add dummy flattened batch x beam dim for broadcasting
+    logits0 = jnp.expand_dims(logits0, axis=0)
+    edge_potentials = jnp.expand_dims(edge_potentials, axis=0)
+
+    def tokens_to_logits(
+        decoding_state: decoding.DecodingState,
+    ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
+      token_indices = decoding_state.cur_token
+      state_cache = decoding_state.cache
+      cur_iter = state_cache['cur_iter']
+      # grab edge potentials for the current timestep
+      # After take_along_axis, cur_edge_potentials has shape
+      # [batch_size * beam_size, timestep, num_states, num_states]
+      # Note the jnp.take_along_axis() output is:
+      # Output[i, j, k, l] = Data[i, indices[i, j, k, l], k, l]
+      cur_edge_potentials = jnp.take_along_axis(
+          # shape: [batch_size * beam_size, 1, num_states, num_states]
+          edge_potentials,
+          jnp.reshape(
+              # e.g. Batch = 2, this is a list [2, 2]
+              jnp.maximum(0, cur_iter[:, 0].astype(jnp.int32) - 1),
+              # We need the indices at each dimension of edge_potentials.
+              # After reshape, it becomes [[[[2]]],[[[2]]]]
+              # JAX will ignore wildcard dimensions with "1" in shape and just
+              # use broadcast to take all values from those dimensions. The 
+              # deepest nested 2 is applied to the axis=1 dimension.
+              (batch_size * beam_size, 1, 1, 1),
+          ),
+          axis=1,
+      )
+      cur_edge_potentials = jnp.squeeze(cur_edge_potentials, axis=1)
+      # get "logits" from edge potentials for requested tokens (except at t0)
+      cur_logits = jnp.matmul(
+          jnp.reshape(
+              jax.nn.one_hot(token_indices, num_states, axis=1),
+              (batch_size * beam_size, 1, num_states),
+          ),
+          cur_edge_potentials,
+      )
+      cur_logits = jnp.squeeze(cur_logits, axis=1)
+      # use our START-only logits for t0, otherwise use the edge potentials
+      logits_for_tokens = jnp.where(cur_iter == 0, logits0, cur_logits)
+      # update state in the cache
+      new_cache = state_cache.copy()
+      new_cache['cur_iter'] = cur_iter + 1
+      return logits_for_tokens, new_cache
+
+    init_cache = {}
+    init_cache['cur_iter'] = jnp.zeros((batch_size, 1))
+
+    top_scoring, _ = decoding.beam_search(
+        inputs=np.zeros([batch_size, decode_length]),
+        cache=init_cache,
+        tokens_to_logits=tokens_to_logits,
+        eos_id=5,
+        num_decodes=beam_size,
+        alpha=0.0,
+        max_decode_len=decode_length,
+        num_beam_grps=num_beam_grps,
+    )
+
+    # The two top scoring sequences should be a tie between
+    # START-AABBA-END
+    # and
+    # START-BBAAB-END
+    # (and greedy beam search will find both these with just two beams)
+
+    top_scoring_strings = [
+        ''.join(states[tok] for tok in top_scoring[0, i, :])
+        for i in range(beam_size)
+    ]
+
+    expected = [
+        'START-AABBA-END', # Group 0 choice 1
+        'START-BBAAB-END', # Group 0 choice 2
+        'START-ACAAB-END', # Group 1 diverse choice 1
+        'START-ACBBA-END', # Group 1 diverse choice 2
+    ]
+    np.testing.assert_array_equal(sorted(top_scoring_strings), sorted(expected))
+
   def test_beam_search_force_decode_prefix(self):
     beam_size = 2
 
