@@ -1,0 +1,10 @@
+project: t5x-self-bleu
+kernel_slug: yipking/t5x-self-bleu
+code_file: t5x/dbs_metrics/self_bleu/t5x_self_bleu_kaggle.ipynb
+accelerator: gpu
+internet: true
+privacy: private
+datasets: []
+competitions: []
+outputs:
+  download_to: .kaggle-outputs/

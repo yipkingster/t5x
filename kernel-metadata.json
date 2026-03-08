@@ -1,0 +1,13 @@
+{
+  "id": "yipking/t5x-self-bleu",
+  "title": "T5X_Self_Bleu",
+  "code_file": "t5x/dbs_metrics/self_bleu/t5x_self_bleu_kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "enable_tpu": false
+}
