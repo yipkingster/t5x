@@ -1,3 +1,9 @@
 *.egg-info
 __pycache__
 .venv
+
+.DS_Store
+.kaggle-outputs/
+.kaggle-run.log
+.pytest_cache/
+notebook.ipynb
