@@ -29,34 +29,26 @@ Here is the piece by piece explanation:
 ### Diverse Beam Search Objective
 DBS partitions the total beams ($B$) into groups ($G$). It optimizes these groups sequentially at each time step. The first group ($g=1$) acts like standard BS. For any subsequent group $g$, a penalty $\Delta$ is applied to discourage the selection of tokens that were already chosen by the previous groups $\{1, \ldots, g-1\}$ at that identical timestep $t$.
 
-$$ \mathbf{Y}_{[t]}^{[g]} = \arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
+$$ \mathbf{Y}_{[t]}^{[g]} = \argmax_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
 
 Here is the piece by piece explanation:
-1. $\mathbf{Y}_{[t]}^{[g]}$ ("Y at step t for group g"): The set of $B'$ tokens collectively chosen specifically for group $g$ at time step $t$.
-2. $\arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The search function. It looks through the entire vocabulary ($\mathcal{V}$) to find the specific combination of candidate next-tokens that maximizes the total score inside the parenthesis.
-3. $\sum_{b=1}^{B'}$: We sum the resulting scores across all $B'$ parallel beams operating exclusively within the current isolated group $g$. (Where $B'$ is simply the total beams $B$ divided by the number of groups $G$).
-4. $\log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X)$: The base log-probability that the model's neural network assigns to the candidate token $y_b^{[t]}$, based purely on the original prompt $X$ and the sequence history of this specific beam $Y_{b,[t-1]}^{[g]}$.
-5. $\lambda$: The `diversity_strength` penalty multiplier. It controls how severely we want to punish the model for copying previous groups.
-6. $\sum_{h=1}^{g-1}$: A loop that mathematically iterates through every single chronologically older group ($h$) that has already been decided at this particular step $t$ (from group $1$ up to $g-1$).
-7. $\Delta(y_b^{[t]}, y_{b}^{[t], [h]})$: The Hamming Diversity Penalty function. This acts as an indicator function: it subtracts points from the score if the candidate token $y_b^{[t]}$ being evaluated is absolutely identical to the token natively chosen by the older group $h$ ($y_{b}^{[t], [h]}$) at this exact same time step $t$.
+1. $\mathbf{Y}_{[t]}^{[g]}$ ("Y at step t for group g"): The set of $B'$ tokens chosen for group $g$ at time step $t$.
+2. $\argmax_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The $\argmax$ function. It looks through the entire vocabulary ($\mathcal{V}$) to find the next-tokens that maximize the total score of the summation next to it.
+3. $\sum_{b=1}^{B'}$: We sum the scores across all $B'$ parallel beam groups. (Where $B'$ is simply the total beams $B$ divided by the number of groups $G$).
+4. $\log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X)$: The log-probability that the model's neural network assigns to the candidate token $y_b^{[t]}$, given the original prompt $X$ and the sequence selected before this timestep for this specific beam group $g$: $Y_{b,[t-1]}^{[g]}$.
+5. $\lambda$: The `diversity_strength` penalty multiplier. It controls how severely we want to punish the model for duplicate tokens.
+6. $\sum_{h=1}^{g-1}$: A loop that iterates through every single previous group ($h$) that has already been decided at this particular step $t$ (from group $1$ up to $g-1$).
+7. $\lambda \sum \Delta(y_b^{[t]}, y_{b}^{[t], [h]})$: The **Hamming Diversity Penalty**. By multiplying the number of occurrences of this token by $\lambda$, we subtract a penalty proportional to how many times the exact same token has already been selected by older groups at this time step.
 
 ---
 
 ## Design Ideas and Architecture
 
-When modifying a complex, heavily optimized library like T5X, our primary goal was **to be as non-invasive to the existing code structure as possible.** 
+When modifying a complex, highly optimized library like T5X, our primary goal was to be as minimum invasive to the existing code structure as possible.
 
 After all, standard Beam Search is merely a special case of Diverse Beam Search where the number of groups (`num_beam_grps`) is exactly $1$. 
 
-Instead of duplicating the massive auto-regressive decoding loops, we cleanly injected our diversity logic purely at the token selection phase. Specifically, we introduced a new function `diverse_beam_search_top_k()` which completely replaces the old `top_k_two_stage` call. When `num_beam_grps == 1`, our new function collapses seamlessly back into the traditional logic with zero performance overhead.
-
----
-
-## KV Cache Handling and JAX Parallelism 
-
-In the T5X `decoding.py` loop, we fetch logits from the Transformer efficiently using auto-regressive Key-Value (KV) attention caches. 
-
-Our implementation preserves JAX's incredible vectorization capabilities globally. Instead of breaking JAX's `vmap` parallelism or modifying the KV cache (`decoding_state.cache`), we apply the logit penalties inside a highly optimized `jax.lax.scan` block. Each sequence independently builds its own historical context in the KV cache natively. Our DBS implementation simply manipulates the sorting logic that governs *which* beams inherit *which* previous cache prefixes.
+Instead of duplicating the decoding loops, we injected our diversity logic purely at the token selection phase. Specifically, we introduced a new function `diverse_beam_search_top_k()` that seamlessly replaces the old `top_k_two_stage` call.
 
 ---
 
@@ -65,13 +57,10 @@ Our implementation preserves JAX's incredible vectorization capabilities globall
 Bringing the math into JAX array operations presented several tricky challenges:
 
 ### 1. Inability to Use Flattened Log-probs Initially
-Standard beam search aggressively flattens the `[num_decodes, vocab_size]` logits array into a massive `[num_decodes * vocab_size]` array to run a single, global `top_k` operation. We couldn't do this immediately, because DBS requires partitioning the `num_decodes` dimension strictly by `num_beam_grps` first to compute intra-group top-K tokens and apply penalties.
+Standard beam search flattens the `[num_decodes, vocab_size]` logits array into a massive `[num_decodes * vocab_size]` array to run a single, global `top_k` operation. We couldn't do this because DBS requires partitioning the `num_decodes` dimension by `num_beam_grps` first to compute intra-group top-K tokens and apply penalties sequentially.
 
-### 2. Iterating and Updating `log_probs` in JAX
-JAX requires static array shapes and strictly immutable updates. We had to implement a `lax.scan` loop over `jax.numpy.arange(num_beam_grps)`. For each isolated group, we computed the Hamming penalty against the specific tokens chosen by all *previous* groups, subtracted that penalty vector from the raw `log_probs`, grabbed the intra-group top candidates, and passed the chosen tokens into the `scan` accumulator for the *next* group to penalize against.
-
-### 3. The `group_offsets` Nuance
-A subtle but critical bug we overcame involved global indexing. When selecting the top indices across flattened beam dimensions, we needed to shift those positional indices by an offset specifically designed for each group (`group_offsets`). Without calculating and adding `group_offsets`, surviving beams selected in Group 2 would incorrectly index into the memory states of Group 1, causing silent corruption for the rest of the generation!
+### 2. The `group_offsets` Nuance
+A subtle but critical bug we overcame involved global indexing. When selecting the top indices across flattened beam dimensions, we must shift those positional indices by an offset specifically designed for each group (`group_offsets`). Without calculating and adding `group_offsets`, surviving beams selected in Group 2 would incorrectly index into the memory states of Group 1, causing silent corruption for the rest of the generation.
 
 ---
 
@@ -79,12 +68,10 @@ A subtle but critical bug we overcame involved global indexing. When selecting t
 
 Validating beam search involves mocking token transition probabilities (edge potentials). The existing T5X unit tests used a Markov chain with mock states `A` and `B`. 
 
-To cleanly evaluate DBS without breaking historical abstractions, we designed and introduced a new state `C`. State `C` was built as a mathematically identical alternate path to `A` and `B` at timestep 2. 
-
-Standard Beam Search natively ignored `C` due to score collisions. However, our new DBS test cleanly verified that the secondary groups (having their log-probs heavily penalized for evaluating states `A` and `B` used by the first group) were appropriately forced to detour and select the path terminating through state `C`, empirically proving that our mathematical implementation is flawless!
+We built the unit test on top of this existing design by introducing a new state `C`. State `C` was designed as a "diverse" alternative path to `A` and `B` with the same costs at 1 timestep. This allows us to reuse the existing infrastructure to test a new state transition path and a new search strategy. By introducing only at 1 timestep it also reduces the complexity and make the code easier to debug.
 
 ---
 
 ## Conclusion & Results
 
-See our formal performance results in [BENCHMARK.md](BENCHMARK.md) where we prove a significant **12.62%** improvement in sample diversity!
+See our formal performance results in [BENCHMARK.md](BENCHMARK.md) where we achieved a significant **12.62%** improvement in sample diversity on the WMT14 English-to-German (En-De) dataset (wmt14_en_de_v003).
