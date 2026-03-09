@@ -16,7 +16,7 @@ The implementation is based on the paper [Diverse Beam Search: Decoding Diverse 
 ### Standard Beam Search Objective
 Since seeking the best probability of a sequence over the entire space of possible sequences is computationally impossible, standard BS acts as a greedy heuristic optimization across $B$ parallel beams (the `num_decodes`). At each time step $t$, it attempts to find the set of next tokens across all beams $Y_{[t]}$ that locally maximizes the probabilities when extending the previous sequence step states:
 
-$$ \mathbf{Y}_{[t]} = \argmax_{y_1^{[t]}, \ldots, y_B^{[t]} \in \mathcal{V} \text{ s.t. } y_i^{[t]} \neq y_j^{[t]}} \sum_{b=1}^B \log P(y_b^{[t]} \mid Y_{b, [t-1]}, X) $$
+$$ \mathbf{Y}_{[t]} = \arg\max_{y_1^{[t]}, \ldots, y_B^{[t]} \in \mathcal{V} \text{ s.t. } y_i^{[t]} \neq y_j^{[t]}} \sum_{b=1}^B \log P(y_b^{[t]} \mid Y_{b, [t-1]}, X) $$
 
 Here is the piece by piece explanation:
 1. $B$ is the number of active beams.
@@ -29,11 +29,11 @@ Here is the piece by piece explanation:
 ### Diverse Beam Search Objective
 DBS partitions the total beams ($B$) into groups ($G$). It optimizes these groups sequentially at each time step. The first group ($g=1$) acts like standard BS. For any subsequent group $g$, a penalty $\Delta$ is applied to discourage the selection of tokens that were already chosen by the previous groups $\{1, \ldots, g-1\}$ at that identical timestep $t$.
 
-$$ \mathbf{Y}_{[t]}^{[g]} = \argmax_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
+$$ \mathbf{Y}_{[t]}^{[g]} = \arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
 
 Here is the piece by piece explanation:
 1. $\mathbf{Y}_{[t]}^{[g]}$ ("Y at step t for group g"): The set of $B'$ tokens chosen for group $g$ at time step $t$.
-2. $\argmax_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The $\argmax$ function. It looks through the entire vocabulary ($\mathcal{V}$) to find the next-tokens that maximize the total score of the summation next to it.
+2. $\arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The $\arg\max$ function. It looks through the entire vocabulary ($\mathcal{V}$) to find the next-tokens that maximize the total score of the summation next to it.
 3. $\sum_{b=1}^{B'}$: We sum the scores across all $B'$ parallel beam groups. (Where $B'$ is simply the total beams $B$ divided by the number of groups $G$).
 4. $\log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X)$: The log-probability that the model's neural network assigns to the candidate token $y_b^{[t]}$, given the original prompt $X$ and the sequence selected before this timestep for this specific beam group $g$: $Y_{b,[t-1]}^{[g]}$.
 5. $\lambda$: The `diversity_strength` penalty multiplier. It controls how severely we want to punish the model for duplicate tokens.
