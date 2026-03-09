@@ -14,21 +14,31 @@ This post reviews the math, design decisions, and implementation challenges of i
 The implementation is based on the paper [Diverse Beam Search: Decoding Diverse Solutions from Neural Sequence Models (Vijayakumar et al., 2016)](https://arxiv.org/abs/1610.02424).
 
 ### Standard Beam Search Objective
-Since seeking the global theoretical distribution $\mathcal{Y}$ over infinite sequences is computationally impossible, standard BS acts as a sequential heuristic optimization across $B$ parallel beams (the `num_decodes`). At each time step $t$, it attempts to find the set of next tokens across all beams $Y_{[t]}$ that locally maximizes the probabilities when extending the previous sequence step states:
+Since seeking the best probability of a sequence over the entire space of possible sequences is computationally impossible, standard BS acts as a greedy heuristic optimization across $B$ parallel beams (the `num_decodes`). At each time step $t$, it attempts to find the set of next tokens across all beams $Y_{[t]}$ that locally maximizes the probabilities when extending the previous sequence step states:
 
-$$ \mathbf{Y}_{[t]} = \arg\max_{y_1^{[t]}, \ldots, y_B^{[t]} \in \mathcal{V} \text{ s.t. } y_i^{[t]} \neq y_j^{[t]}} \sum_{b=1}^B \log P(y_b^{[t]} \mid Y_{b, [t-1]}, X) $$
+$$ \mathbf{Y}_{[t]} = \argmax_{y_1^{[t]}, \ldots, y_B^{[t]} \in \mathcal{V} \text{ s.t. } y_i^{[t]} \neq y_j^{[t]}} \sum_{b=1}^B \log P(y_b^{[t]} \mid Y_{b, [t-1]}, X) $$
 
-Here is the turn by turn explanation:
+Here is the piece by piece explanation:
 1. $B$ is the number of active beams.
-2. The superscript $[t]$ placed in brackets (as in $y^{[t]}$ or $Y_{[t]}$) specifically denotes the **time step** index of the sequence generation. For example, $y_b^{[t]}$ represents the single token being evaluated exactly at time step $t$ for beam path $b$, distinguishing it from tokens generated at previous time steps.
-3. The term $\text{s.t. } y_i^{[t]} \neq y_j^{[t]}$ simply forces the algorithm to select $B$ physically distinct candidate tokens to explore across its separate beams, avoiding complete duplication inside a single timestep.
-4. Given the input $X$ (the translating sentence) and the previous context $Y_{b, [t-1]}$ leading up to this point within beam $b$, we find the specific next token $y_b^{[t]}$ that maximizes that beam's conditional probability.
+2. The superscript $[t]$ placed in brackets (as in $y^{[t]}$ or $\mathbf{Y}_{[t]}$) denotes the **time step** index of the sequence generation process. For example, $y_b^{[t]}$ represents the single token being evaluated exactly at time step $t$ for beam $b$.
+3. The "s.t." in the term $\text{s.t. } y_i^{[t]} \neq y_j^{[t]}$ means "subject to". It simply forces the algorithm to select $B$ distinct candidate tokens in each beam, avoiding duplication at a single timestep. 
+4. The summation run $\sum_{b=1}^B$ means the algorithm searches for a **set** of next-tokens that maximizes the probabilities across all $B$ concurrently active beam-branches strictly localized at step $t$.
+5. $\log P$ ("Log-Probability"): The natural logarithm of the probability score assigned by the neural network.  We use the sum of log-probabilities instead of product of raw probabilities to avoid numerical underflow by multiplying many small numbers together.
+6. ($y_b^{[t]} \mid Y_{b, [t-1]}, X$): Given the prompt/input $X$ (e.g. the translating sentence) and the previous context $Y_{b, [t-1]}$ leading up to this point within beam $b$, we find the specific next token $y_b^{[t]}$ that maximizes that beam's conditional probability.
+
 ### Diverse Beam Search Objective
-DBS partitions the total beams ($B$) into independent groups ($G$). It optimizes these groups sequentially at each time step. The first group ($g=1$) acts like standard BS. However, for any subsequent group $g$, a massive penalty $\Delta$ is applied at each step $t$ to discourage the selection of tokens that were already chosen by the previous groups $\{1, \ldots, g-1\}$ at that identical timestep $t$.
+DBS partitions the total beams ($B$) into groups ($G$). It optimizes these groups sequentially at each time step. The first group ($g=1$) acts like standard BS. For any subsequent group $g$, a penalty $\Delta$ is applied to discourage the selection of tokens that were already chosen by the previous groups $\{1, \ldots, g-1\}$ at that identical timestep $t$.
 
 $$ \mathbf{Y}_{[t]}^{[g]} = \arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
 
-Where $B'$ is the number of beams per isolated group ($B/G$), $\lambda$ represents `diversity_strength`, and $\Delta$ leverages the Hamming Diversity Penalty (an indicator function penalizing colliding tokens already placed in the queue precisely at timestep $t$ by previous groups).
+Here is the piece by piece explanation:
+1. $\mathbf{Y}_{[t]}^{[g]}$ ("Y at step t for group g"): The set of $B'$ tokens collectively chosen specifically for group $g$ at time step $t$.
+2. $\arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The search function. It looks through the entire vocabulary ($\mathcal{V}$) to find the specific combination of candidate next-tokens that maximizes the total score inside the parenthesis.
+3. $\sum_{b=1}^{B'}$: We sum the resulting scores across all $B'$ parallel beams operating exclusively within the current isolated group $g$. (Where $B'$ is simply the total beams $B$ divided by the number of groups $G$).
+4. $\log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X)$: The base log-probability that the model's neural network assigns to the candidate token $y_b^{[t]}$, based purely on the original prompt $X$ and the sequence history of this specific beam $Y_{b,[t-1]}^{[g]}$.
+5. $\lambda$: The `diversity_strength` penalty multiplier. It controls how severely we want to punish the model for copying previous groups.
+6. $\sum_{h=1}^{g-1}$: A loop that mathematically iterates through every single chronologically older group ($h$) that has already been decided at this particular step $t$ (from group $1$ up to $g-1$).
+7. $\Delta(y_b^{[t]}, y_{b}^{[t], [h]})$: The Hamming Diversity Penalty function. This acts as an indicator function: it subtracts points from the score if the candidate token $y_b^{[t]}$ being evaluated is absolutely identical to the token natively chosen by the older group $h$ ($y_{b}^{[t], [h]}$) at this exact same time step $t$.
 
 ---
 
