@@ -1,6 +1,6 @@
 # Diverse Beam Search (DBS) Benchmark
 
-This document details the evaluation results of the Diverse Beam Search (DBS) implementation in T5X compared against standard Beam Search. 
+This document details the evaluation results of the Diverse Beam Search (DBS) [implementation](https://github.com/yipkingster/t5x/blob/main/t5x/dbs_metrics/TECH_BLOG.md) in T5X compared against standard Beam Search. 
 
 The evaluation is conducted on the **WMT14 English-to-German (En-De)** dataset (`wmt14_en_de_v003`) using the `t5_base` model (checkpoint step: 999900) [^1].
 
