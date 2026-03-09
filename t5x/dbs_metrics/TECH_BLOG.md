@@ -2,7 +2,7 @@
 
 Standard sequence generation models traditionally rely on **Beam Search (BS)** to find the most likely translation or text sequence. However, standard BS suffers from a critical flaw: a lack of diversity. Because the algorithm explores paths based purely on descending probability, the final candidates often end up being permutations of the exact same sentence, differing by only a single word or punctuation mark. 
 
-So we implemented [**Diverse Beam Search (DBS)**](https://github.com/yipkingster/t5x/blob/2aaa419ffe1da0777e1f8068c256849aa70d40fb/t5x/decoding.py#L1333). DBS solves this by partitioning the beams into independent groups, enforcing diversity penalties sequentially so that subsequent groups are mathematically forced to explore different vocabulary compared to prior groups.
+So we implemented [**Diverse Beam Search (DBS)**](https://github.com/yipkingster/t5x/blob/2aaa419ffe1da0777e1f8068c256849aa70d40fb/t5x/decoding.py#L1333). DBS solves this by partitioning the beams into independent groups, enforcing diversity penalties sequentially so that subsequent groups are mathematically forced to explore different vocabulary compared to prior groups. This improved the Self-BLEU score by [12%](https://github.com/yipkingster/t5x/blob/main/t5x/dbs_metrics/BENCHMARK.md).
 
 This post reviews the math, design decisions, and implementation challenges of integrating DBS natively into the Google T5X sequence decoding framework.
 
